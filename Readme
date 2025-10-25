@@ -1,0 +1,218 @@
+# Ferroque
+
+A production-minded background job queue service built in Rust. Ferroque lets any internal service offload slow or failure-prone work — sending emails, resizing images, syncing third-party APIs — to async workers that handle retries, scheduling, and failure recovery automatically.
+
+Built with Axum, SQLx, Tokio, and PostgreSQL. No Redis. No external message broker. Just Postgres doing what it does best.
+
+---
+
+## Why this exists
+
+Any backend that does real work eventually hits the same problem: some tasks are too slow or too unreliable to run inside an HTTP request. Ferroque solves this by acting as the infrastructure layer between *"something happened"* and *"the work got done"* — letting callers submit jobs and return immediately while workers handle execution in the background.
+
+---
+
+## Architecture
+
+```
+Caller service  ──POST /jobs──▶  HTTP API (Axum)
+                                      │
+                                      ▼
+                               PostgreSQL (jobs table)
+                                      │
+                         ┌────────────┴────────────┐
+                         ▼                         ▼
+                   Worker pool               Scheduler
+                  (Tokio tasks)           (stuck job reaper)
+                         │
+                         ▼
+                   Job handler fn
+```
+
+**HTTP API** — Axum REST API protected by API key middleware. Accepts job submissions and exposes job status endpoints.
+
+**PostgreSQL** — Single source of truth. Every job lives in a `jobs` table with a status that drives the full lifecycle. Using Postgres as the queue (rather than Redis) gives durability and transactional guarantees with one less infrastructure dependency.
+
+**Worker pool** — A configurable number of concurrent Tokio tasks that poll for work. Workers claim jobs atomically using `SELECT ... FOR UPDATE SKIP LOCKED`, which prevents any two workers from picking up the same job without any application-level locking.
+
+**Scheduler** — A background Tokio task that runs every 30 seconds to reap stuck jobs. If a worker crashes mid-execution, the scheduler detects jobs that have been in `running` state too long and requeues them.
+
+---
+
+## Job lifecycle
+
+```
+Pending ──▶ Running ──▶ Succeeded
+                │
+                ▼
+             Failed ──▶ Pending  (retries remaining, exponential backoff)
+                │
+                ▼
+              Dead  (max attempts reached)
+```
+
+Retry backoff is calculated entirely in SQL:
+
+```sql
+run_at = NOW() + (INTERVAL '1 second' * POWER(2, attempts))
+```
+
+Attempt 1 retries after 2s, attempt 2 after 4s, attempt 3 after 8s — no application-level timers.
+
+---
+
+## API
+
+All endpoints require an `x-api-key` header.
+
+### Enqueue a job
+
+```
+POST /jobs
+```
+
+```json
+{
+  "job_type": "send_email",
+  "payload": { "to": "user@example.com" },
+  "priority": 0,
+  "max_attempts": 3,
+  "run_at": "2026-04-01T09:00:00Z"
+}
+```
+
+`run_at` defaults to now. Set it in the future for scheduled jobs. `priority` is used to order job pickup — higher values run first.
+
+**Response `201 Created`:**
+
+```json
+{
+  "id": "018e1b2c-3d4e-7f8a-9b0c-1d2e3f4a5b6c",
+  "job_type": "send_email",
+  "status": "pending",
+  "run_at": "2026-04-01T09:00:00Z"
+}
+```
+
+### Get a job
+
+```
+GET /jobs/:id
+```
+
+```json
+{
+  "id": "018e1b2c-3d4e-7f8a-9b0c-1d2e3f4a5b6c",
+  "job_type": "send_email",
+  "payload": { "to": "user@example.com" },
+  "status": "succeeded",
+  "attempts": 1,
+  "max_attempts": 3,
+  "error": null,
+  "run_at": "2026-04-01T09:00:00Z",
+  "created_at": "2026-03-23T08:00:00Z"
+}
+```
+
+### List jobs
+
+```
+GET /jobs
+```
+
+Returns the 100 most recently created jobs.
+
+### Cancel a job
+
+```
+POST /jobs/:id/cancel
+```
+
+Moves a `pending` job to `dead`. Has no effect on jobs already running or completed.
+
+---
+
+## Running locally
+
+**Prerequisites:** Docker and Docker Compose.
+
+```bash
+git clone https://github.com/your-username/ferroque
+cd ferroque
+docker compose up
+```
+
+The service starts on port `3000`. Default API key is `ferroque-secret-key`.
+
+```bash
+# Enqueue a job
+curl -X POST http://localhost:3000/jobs \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: ferroque-secret-key" \
+  -d '{"job_type": "send_email", "payload": {"to": "user@example.com"}}'
+
+# Check its status
+curl http://localhost:3000/jobs/<id> \
+  -H "x-api-key: ferroque-secret-key"
+```
+
+---
+
+## Running without Docker
+
+```bash
+# Start Postgres
+createdb ferroque
+
+# Set environment
+cp .env.example .env   # edit DATABASE_URL and API_KEY
+
+# Run
+cargo run
+```
+
+---
+
+## Tests
+
+```bash
+# Unit tests (no database required)
+cargo test --lib
+
+# All tests including integration
+cargo test
+```
+
+The test suite covers auth enforcement, job enqueue/retrieve round trips, error responses, the handler registry, and error-to-HTTP-status mapping.
+
+---
+
+## Key technical decisions
+
+**Postgres as the queue.** Most job queue implementations reach for Redis. Ferroque uses Postgres deliberately — jobs are transactional data that benefit from durability and ACID guarantees. A crashed worker cannot cause a job to vanish. The tradeoff is throughput: Postgres tops out at tens of thousands of jobs per second where Redis can do millions. For most real-world workloads, that's not a constraint.
+
+**`SELECT FOR UPDATE SKIP LOCKED`.** This single Postgres feature makes the whole system safe at any concurrency. When a worker claims a job, it locks that row. Any other worker that runs the same query simultaneously sees the lock and skips to the next available job. No application-level mutexes, no distributed locks, no coordination overhead.
+
+**Exponential backoff in SQL.** Retry delay is calculated at the database level using `POWER(2, attempts)` rather than in application code. This keeps retry logic consistent regardless of which worker processes a job and eliminates any in-memory state that could be lost on a crash.
+
+**Tokio for concurrency.** Workers are async tasks, not OS threads. A pool of 4 workers consumes 4 Tokio tasks rather than 4 threads — the same process can handle hundreds of concurrent workers without the memory overhead of a thread-per-worker model.
+
+---
+
+## What I'd build next
+
+- **`LISTEN/NOTIFY` instead of polling.** Currently workers poll Postgres every 500ms. Postgres's pub/sub mechanism would let the database wake workers instantly when a new job arrives, reducing latency and unnecessary queries.
+- **Per-queue concurrency limits.** Right now all job types share the same worker pool. A dedicated queue per job type would let you say "max 2 concurrent email jobs, max 10 concurrent image resizes."
+- **Web UI for job inspection.** A simple dashboard showing job counts by status, recent failures, and retry history — useful for operators debugging production issues.
+- **Metrics endpoint.** Prometheus-compatible counters for jobs enqueued, succeeded, failed, and dead — plus worker utilisation and average queue depth.
+
+---
+
+## Stack
+
+- **[Axum](https://github.com/tokio-rs/axum)** — async web framework
+- **[SQLx](https://github.com/launchbadge/sqlx)** — async Postgres driver with compile-time query verification
+- **[Tokio](https://tokio.rs)** — async runtime
+- **[PostgreSQL 16](https://www.postgresql.org)** — job persistence and atomic claiming
+- **[serde](https://serde.rs)** — serialization
+- **[thiserror](https://github.com/dtolnay/thiserror)** — structured error types
