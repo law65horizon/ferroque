@@ -1,8 +1,8 @@
 use crate::{db, models::Job};
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use sqlx::PgPool;
-use tokio::time::{sleep, Duration};
+use sqlx::{PgPool, postgres::PgListener};
+use tokio::time::{Duration, sleep, timeout};
 use tracing::{error, info, warn};
 // use tracing_subscriber::registry;
 
@@ -40,51 +40,90 @@ pub async fn run_worker(
     worker_id: usize
 ) {
     info!("Worker {worker_id} started");
+    
+    // each worker holds its own listen connection
+    let mut listener = PgListener::connect_with(&pool)
+        .await
+        .expect("Worker {worker_id} failed to connect");
+
+    listener
+        .listen("ferroque_jobs")
+        .await
+        .expect("Worker {worker_id} failed to listen}");
+
 
     loop {
-        match db::claim_job(&pool).await {
-            Ok(Some(job)) => {
-                let job_id = job.id;
-                let job_type = job.job_type.clone();
-                info!("Worker {worker_id} claimed job {job_id} (type: {job_type})");
-
-                match registry.get(&job_type) {
-                    Some(handler) => {
-                        match handler(job).await {
-                            Ok(()) => {
-                                info!("Job {job_id} succeeded");
-                                if let Err(e) = db::resolve_job(&pool, job_id, true, true, None).await {
-                                    error!("Failed to mark job {job_id} succeeded: {e}")
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Job {job_id} failed: {e}");
-                                if let Err(db_err) = db::resolve_job(&pool, job_id, false, false, Some(e.to_string())).await {
-                                    error!("Failed to mark job {job_id} failed: {db_err}")
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        warn!("No handler registered for job type '{job_type}', marking dead");
-                        db::resolve_job(
-                            &pool, 
-                            job_id, 
-                            false, 
-                            true,
-                            Some(format!("No handler for job type '{job_type}'"))
-                        ).await.ok();
-                    }
+        // Drain any jobs that are already pending before waiting
+        // Handles jobs that arrived before we started listening,
+        // or that were missed during reconnects
+        loop {
+            match db::claim_job(&pool).await {
+                Ok(Some(job)) => execute_job(&pool, registry.clone(), worker_id, job).await,
+                Ok(None) => break, // nothing pending, go await for a notification
+                Err(e) => {
+                    error!("Worker {worker_id} error claiming job: {e}");
+                    sleep(Duration::from_secs(2)).await;
+                    break;
                 }
             }
-            Ok(None) => {}
-            Err(e) => {
-                error!("Worker {worker_id} error claiming job: {e}");
+        }
+
+        match timeout(Duration::from_secs(30), listener.recv()).await {
+            Ok(Ok(notification)) => {
+                let job_id = notification.payload();
+                info!("Worker {worker_id} notified about job {job_id}");
+            }
+            Ok(Err(e)) => {
+                error!("Worker {worker_id} listener error: {e}");
                 sleep(Duration::from_secs(2)).await;
+            }
+            Err(_) => {
+                info!("Worker {worker_id} timeout sweep")
             }
         }
     }
 }
+
+async  fn execute_job(
+    pool: &PgPool,
+    registry: Arc<HandlerRegistery>,
+    worker_id: usize,
+    job: crate::models::Job
+) {
+    let job_id = job.id;
+    let job_type = job.job_type.clone();
+    info!("Worker {worker_id} claimed job {job_id} (type: {job_type})");
+
+    match registry.get(&job_type) {
+        Some(handler) => {
+            match handler(job).await {
+                Ok(()) => {
+                    info!("Job {job_id} succeeded");
+                    if let Err(e) = db::resolve_job(&pool, job_id, true, true, None).await {
+                        error!("Failed to mark job {job_id} succeeded: {e}")
+                    }
+                }
+                Err(e) => {
+                    warn!("Job {job_id} failed: {e}");
+                    if let Err(db_err) = db::resolve_job(&pool, job_id, false, false, Some(e.to_string())).await {
+                        error!("Failed to mark job {job_id} failed: {db_err}")
+                    }
+                }
+            }
+        }
+        None => {
+            warn!("No handler registered for job type '{job_type}', marking dead");
+            db::resolve_job(
+                &pool, 
+                job_id, 
+                false, 
+                true,
+                Some(format!("No handler for job type '{job_type}'"))
+            ).await.ok();
+        }
+    }
+}
+
 
 pub async fn start_workers(
     pool: PgPool,

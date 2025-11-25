@@ -16,7 +16,8 @@ services:
       - "3000:3000"
     environment:
       DATABASE_URL: postgres://postgres:${DB_PASSWORD}@postgres:5432/ferroque
-      API_KEY: ${API_KEY}
+      API_KEY: ${API_KEY:?API_KEY is missing in your .env file}
+      WORKER_COUNT: ${WORKER_COUNT:-10}
     depends_on:
       - postgres
 

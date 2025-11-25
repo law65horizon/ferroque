@@ -28,6 +28,7 @@ async fn main() {
     registry.register("send_email", |job| async move {
         let to = job.payload["to"].as_str().unwrap_or("unknown");
         tracing::info!("sending email to {to}");
+        // api call
         tokio::time::sleep(Duration::from_millis(200)).await;
         Ok(())
     });
@@ -35,6 +36,7 @@ async fn main() {
     registry.register("resize_image", |job| async move {
         let url = job.payload["url"].as_str().unwrap_or("unknown");
         tracing::info!("Resizing image at {url}");
+        // api call
 
         if job.attempts == 1 {
             anyhow::bail!("Image service temporarily unavailable")
@@ -46,12 +48,16 @@ async fn main() {
     tokio::spawn(async move {
         run_scheduler(scheduler_pool).await;
     });
-    start_workers(pool.clone(), registry, 4).await;
+    let worker_count = std::env::var("WORKER_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    start_workers(pool.clone(), registry, worker_count).await;
 
     let state = AppState { pool };
     let app = api::router(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
         .unwrap();
 
